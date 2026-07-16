@@ -70,6 +70,172 @@ Probably the WAL recovery logic, specifically the redo/undo ordering. It's conce
 
 ---
 
+## Storage manager
+
+### Walk me through the KeyVDB storage stack — what are the layers and how do they interact?
+
+Three layers, built in dependency order.
+
+**DiskManager** is the only component that talks to the filesystem. Everything else talks in page IDs. DiskManager translates "give me page 7" into a `pread` at offset 7 × 4096 in the file. It owns the file descriptor, and it's the only place `fsync` is called.
+
+**FreeList** lives on page 0 and tracks which page IDs have been freed and are available for reuse. When a B+Tree node is deleted after a merge, its page ID goes here. The next allocation checks FreeList first, before extending the file. FreeList talks directly to DiskManager — not to the BufferPool — to avoid a circular dependency and to ensure page 0 can never be accidentally evicted while it's being mutated.
+
+**BufferPool** is the in-memory cache. It holds up to 64 page frames in RAM. Every B+Tree operation goes through the pool: `fetch_page` pins a page (loading from disk on a cache miss), the caller reads or modifies it, then `unpin_page(id, dirty)` releases the pin. When all frames are in use, the pool evicts the least recently used unpinned frame. If the evicted frame is dirty, it's written to disk before being overwritten.
+
+Construction order is DiskManager, then FreeList (calls `load()` to read page 0), then BufferPool. Destruction is reversed.
+
+### What is a pin count and why does it matter?
+
+Pin count is the number of active users of a page frame. When you call `fetch_page`, the count goes up. When you call `unpin_page`, it goes down. A frame with pin count > 0 cannot be evicted.
+
+Without pin counts, the buffer pool would have no way to know whether a caller is still using a frame before overwriting it. If the pool evicted a frame mid-use, the caller's `Page*` pointer would point at garbage. Pin counts make this safe: a page you've fetched will stay resident until you unpin it, no matter how many other pages are requested.
+
+The discipline we enforce: every `fetch_page` is matched by exactly one `unpin_page`. Missing an unpin is a pin leak — that frame is never evicted, the pool gradually runs out of frames, and eventually `new_page` returns nullptr. Forgetting a pin is subtle and doesn't crash immediately, which is why every call site has an explicit comment explaining the dirty/clean choice.
+
+### Why does eviction need to flush dirty pages? Isn't that what Commit() is for?
+
+`Commit()` handles crash safety — it ensures that committed data survives a crash by fsyncing the WAL. But flushing dirty pages on eviction is about *normal-operation data loss prevention*, which is a separate concern.
+
+Imagine you call `unpin_page(id, dirty=true)`. You've told the pool "this page has been modified." Later, under memory pressure, the pool decides to evict that frame. If it doesn't flush the dirty frame before overwriting it, your writes are silently discarded — no crash, no error, just gone data. `crash_test.sh` wouldn't catch this because it tests crash scenarios, not eviction scenarios.
+
+So the rule is: dirty eviction must be identical to an explicit `flush_page()` call. If a frame is dirty when evicted, it goes to disk, full stop. This is what `evict_frame()` does in the code.
+
+### How does reopening an existing database work? What would break if num_pages started at 0?
+
+On open, DiskManager does `lseek(fd, 0, SEEK_END)` and divides by PAGE_SIZE to compute the actual number of pages in the file. This is the authoritative count.
+
+If `num_pages_` were reset to 0 on reopen, the next `allocate_page()` call would return page ID 0 and start writing at offset 0 — directly overwriting the FreeList header on page 0, and then pages 1, 2, etc. All existing data would be silently clobbered. The test `DiskManagerTest::PersistAcrossReopen` specifically verifies that reopening returns the correct page count.
+
+---
+
+## B+Tree internals
+
+### Explain the slotted page layout — why not just store cells sequentially?
+
+Sequential storage is simple but brittle: if you want to delete a cell or insert one in the middle, you have to shift every byte after it. For variable-length keys, that's expensive and fragmentation-prone.
+
+Slotted pages solve this with indirection. The page has two regions: a slot array that grows from the front, and a cell heap that grows from the back. The slot array contains small fixed-size offsets (2 bytes each) that point into the cell heap. When you want cell 5, you look up `slots[5]` to get the byte offset, then read the cell bytes at that offset.
+
+Deleting a cell: just remove its slot entry and shift the remaining slots. The cell bytes become "dead space" in the heap — fragmented but harmless. When fragmentation blocks a new insertion, `compact()` rebuilds the heap from scratch, packing all live cells tightly.
+
+Inserting: carve space from the top of the heap (subtract the cell size from `cell_end`), write the bytes, then add a slot entry at the right sorted position and shift the others right.
+
+Fullness is checked by free space, not key count: `free_space = cell_end - free_end`. We need at least `sizeof(slot_offset_t) + payload_bytes` free bytes to insert a new cell. This handles variable-length keys correctly.
+
+### What's the difference between a leaf split and an internal split?
+
+**Leaf split (copy-up):** The separator key is *copied* to the parent — it stays in the right leaf. This is necessary because leaf nodes hold all the actual data. If we removed the separator from the leaf, we'd lose a key.
+
+**Internal split (push-up):** The median key is *promoted* to the parent and removed from both halves. Internal nodes only hold routing keys — they don't need to hold every key. The promoted key acts as a boundary between the two new halves in the parent.
+
+The name "B+Tree" (as opposed to "B-Tree") specifically refers to this distinction: all actual data lives in the leaves, and internal nodes are purely for routing.
+
+### How does find_leaf work, and why does it unpin internal nodes immediately?
+
+`find_leaf` starts at the root and descends by binary searching each internal node for the right child pointer. When it finds the child pointer, it saves the page ID in a `breadcrumbs` vector, unpins the internal page (dirty=false, it was read-only), and moves to the child.
+
+The key constraint: only the final leaf is returned still pinned. Every intermediate internal node is unpinned before we descend.
+
+Why? The buffer pool has 64 frames. If we held every node on the path to a leaf pinned simultaneously, a tree 64 levels deep would exhaust the pool before we could even read the leaf. Even at typical depths (3–4 levels for millions of keys), keeping all traversed pages pinned wastes frames that other concurrent operations (in Milestone 4) will need.
+
+The breadcrumbs vector stores re-fetchable page IDs, not live `Page*` pointers. When `insert_into_parent` needs to go back up the tree, it re-fetches each parent by ID.
+
+### What happens when a split propagates all the way to the root?
+
+When the root splits, there's no parent to receive the separator. Instead:
+
+1. Allocate a new page.
+2. Initialise it as an internal node with `parent_id = INVALID_PAGE_ID`.
+3. Set its `first_child` to the old left half.
+4. Insert the separator key with the right half as its right child.
+5. Update `root_page_id_` to the new root's page ID.
+6. Persist the new root ID to page 0's reserved slot via `FreeList::set_root_page_id()`.
+7. Update `parent_id` on both children to point to the new root.
+
+The tree grows one level taller. This is the only way the tree's height increases — it always grows upward from a root split, never from the bottom.
+
+### Walk me through how a merge works and when it's triggered.
+
+After removing a key, if the leaf holds less than half the usable space (by byte count), it's "underflowing." We need to fix it before returning.
+
+First, we check the left sibling. If it has spare capacity (more than half full), we steal its rightmost cell and move it to our leftmost position. Then we update the separator in the parent — the separator between left and us now reflects the new split point.
+
+If the left sibling is also near-minimum (can't spare a key), we check the right sibling. Same idea: steal the leftmost cell from the right, update the separator.
+
+If neither sibling can spare anything, we merge. We absorb the right sibling's cells into ourselves, pull the separator key down from the parent (for internal nodes), and remove the separator and right sibling's pointer from the parent. The right sibling's page is freed back to the FreeList.
+
+Now the parent has one fewer key. If that puts the parent below half-full, we recurse. This can cascade all the way to the root. If the root ends up as an internal node with zero keys and a single child, we collapse: the child becomes the new root, the old root is freed, and the tree shrinks one level.
+
+### Why maintain parent pointers on every page?
+
+The immediate reason is upward propagation: after a split or merge in a child, we need to insert or remove a separator in the parent. We could recover the parent by re-traversing from the root (the breadcrumbs approach we use during traversal), but that requires re-traversing while modifications are in progress.
+
+The deeper reason is Milestone 4. When we add concurrent access, we'll need "latch crabbing" — acquire a child's latch, then release the parent's latch once we know the child is safe. Knowing which node to latch-crab *to* requires knowing the parent ID without re-traversing from the root (which would require holding the root latch the whole time, defeating the purpose of crabbing). Parent pointers stored on each page solve this cleanly.
+
+---
+
+## Write-ahead log and recovery
+
+### What is a write-ahead log and why does "write-ahead" matter?
+
+The WAL is an append-only file where we record every intended change before applying it to the database. "Write-ahead" means the log record is durably written before we touch the B+Tree page. If the process crashes mid-write, the log tells us exactly what was in progress.
+
+Without the WAL, a crash in the middle of a B+Tree split could leave pointers updated on one side but not the other. The tree would be structurally inconsistent and unreadable. With the WAL, we can always recover: replay committed writes, undo uncommitted ones.
+
+### What is an LSN and what is it used for?
+
+LSN stands for Log Sequence Number. It's a monotonically increasing integer assigned to every WAL record. Every record in the log has a unique LSN; later records have higher LSNs.
+
+The LSN has two uses:
+
+1. **Ordering**: LSNs give us a total order over all log records, which is what we need to replay them correctly during recovery.
+
+2. **page_lsn for redo skipping**: each data page stores the LSN of the last WAL record that modified it (`page_lsn` in `PageHeader`). During redo, if a page's `page_lsn` is already >= the record's LSN, that write was already persisted before the crash. We can skip the record. This is the standard ARIES optimisation.
+
+### Walk me through the commit protocol — what happens in order?
+
+1. Log BEGIN (when the transaction starts).
+2. For each write: log WRITE(key, before_val, after_val), then apply to the B+Tree in-memory.
+3. Log COMMIT.
+4. `fsync(WAL file)` — **this is the durability point**. After this call returns, the COMMIT is permanently on disk.
+5. Flush dirty B+Tree pages to the data file.
+
+Steps 5 happens after the durability point. If we crash between steps 4 and 5, recovery will redo the writes using the WAL. The key insight: the WAL is the source of truth. The data file is just a performance cache that saves us from replaying the entire WAL on every startup.
+
+### What does recovery look like — the three phases?
+
+**Analysis**: scan the WAL forward. Build the "loser set" — transactions with a BEGIN but no COMMIT and no ABORT. These crashed mid-transaction. Transactions with ABORT are not losers; they were already undone in memory at rollback time.
+
+**Redo**: replay every WRITE record from committed (and loser) transactions in LSN order. Apply the after-values. This gets the B+Tree to the exact state it was in at crash time — all committed writes, all in-progress writes, aborted writes already absent.
+
+**Undo**: for each loser transaction, walk its WRITE records in reverse LSN order and apply before-images. Keys that were inserted are deleted; keys that were updated are restored to their original values.
+
+The order matters: redo first, then undo. You can't undo safely until everything is in the crash-time state, because the before-images in the log describe the state just before each write — not the state you'd find after a partial redo.
+
+### Why does Rollback not need the WAL for correctness?
+
+During a rollback, we have the write-set in memory — every key the transaction touched, along with its before-value. We just apply the before-images directly to the B+Tree. No log read required.
+
+We still write an ABORT record to the WAL. This is important for recovery: if the process crashes between the rollback completing and the next clean shutdown, recovery needs to know not to undo this transaction's writes again. ABORT says "I already undid everything." A missing COMMIT and missing ABORT says "I crashed mid-transaction; please undo me."
+
+### What's the difference between ABORT and a loser transaction?
+
+ABORT means the transaction completed its rollback before the crash. All its writes were reversed in memory, and the reversed state was written to disk as part of normal operation.
+
+A loser transaction had no COMMIT and no ABORT when the crash happened. It was still in progress. Some of its writes may have made it to disk (via dirty eviction from the buffer pool), some may not. Recovery has to redo to get to the crash-time state, then undo to remove the partial work.
+
+### What is a bug you found while building the WAL, and how did you debug it?
+
+When first running `WalIntegration.CommitPersistsKeys`, the test crashed with an assertion in `Node::Node()` — "page type must be LEAF or INTERNAL." The assertion was firing on the very first operation: `btree_.insert()` during redo was calling `find_leaf()`, which fetched the root page and found it had type `DB_HEADER` instead of `BTREE_LEAF`.
+
+Adding a print showed the root page ID was 0, not 1. Page 0 is the FreeList header — a `DB_HEADER` page.
+
+Tracing back: `DB::Open` calls `fl_->root_page_id()` to determine whether this is a fresh database or an existing one. For a fresh database, `root_page_id()` should return `INVALID_PAGE_ID (-1)`. But `FreeList::load()` was initialising page 0 with zero bytes, and `root_page_id()` reads a 4-byte `int32_t` from the tail slot — which was 0, not -1. `DB::Open` saw 0, concluded "existing database, root is at page 0," and tried to open a B+Tree rooted at the DB header page.
+
+The fix was two lines: explicitly write `INVALID_PAGE_ID` to the root slot in `FreeList::load()` when creating a new database. The broader lesson: "zero" and "unset" are different things. When your sentinel value is not zero, you have to write it explicitly — you can't rely on zero-initialisation.
+
+---
+
 ## Database internals
 
 ### What is ACID and why does each letter matter?
@@ -210,4 +376,4 @@ This is why cache misses in production database systems are treated as serious p
 
 ---
 
-*This file will keep growing. Next batch of questions will cover the storage manager internals, specific B+Tree edge cases, and the WAL recovery algorithm in more detail.*
+*This file will keep growing. Next batch of questions will cover two-phase locking in depth, deadlock detection, the lock compatibility matrix, and what happens when two transactions try to write the same key simultaneously.*
