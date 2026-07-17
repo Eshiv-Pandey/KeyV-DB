@@ -1,4 +1,4 @@
-# progress1.md — What Even Is a Database?
+# progress1.md: What Even Is a Database?
 
 *This is the first entry in a series of notes I'm keeping as I build KeyVDB, an ACID-compliant embedded key-value store in C++. I'm writing these as if I'm explaining things to another student who also has no background in database internals, because that's who I was when I started. If something seems over-explained, that's intentional.*
 
