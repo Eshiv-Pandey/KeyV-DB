@@ -236,6 +236,65 @@ The fix was two lines: explicitly write `INVALID_PAGE_ID` to the root slot in `F
 
 ---
 
+## Two-phase locking and concurrency
+
+### What is two-phase locking and why does it give serializability?
+
+2PL has two phases: growing (acquire locks, never release) and shrinking (release all at once at commit/rollback, never acquire after). The strict version we use releases all locks at commit time.
+
+It gives serializability because: if two transactions conflict (one writes what the other reads), one of them must wait for the other to commit before it can proceed. The waiting transaction only sees the committed state — never the in-progress state. The result is equivalent to running them one after the other.
+
+The intuition is a conflict graph argument: if you can't release a lock until you're done, then conflicting transactions must be totally ordered by their commit times. A total order = serial execution.
+
+### What is the lock compatibility matrix?
+
+```
+         Requester:  S        X
+Holder:
+    S              ✓ OK     ✗ WAIT
+    X              ✗ WAIT   ✗ WAIT
+```
+
+Two shared (read) locks on the same key are compatible — multiple readers can coexist. Any combination involving an exclusive (write) lock requires the requester to wait.
+
+### What is a lock upgrade and when does it deadlock?
+
+A lock upgrade is when a transaction already holding an S-lock on a key needs to promote it to X (e.g., it read a value and now wants to write it).
+
+Upgrade is allowed if the upgrading transaction is the only S-lock holder — it's effectively going from S-alone to X. It deadlocks if another transaction also holds S on the same key: both would need to upgrade, each waiting for the other to release their S-lock.
+
+In our implementation, the upgrade attempt times out after 200ms (DeadlockException) if blocked.
+
+### What's the difference between deadlock detection and deadlock prevention?
+
+**Detection** (wait-for graph): maintain a directed graph where A→B means "A is waiting for a lock held by B." A cycle means deadlock. Detect it and abort one transaction. Accurate but complex — you have to maintain the graph incrementally and run cycle detection efficiently.
+
+**Prevention** (timeouts): if a lock wait exceeds a threshold, assume deadlock and abort. Simple and correct — every actual deadlock eventually resolves when one transaction times out. Downside: occasionally aborts transactions that were slow but not actually deadlocked.
+
+We use timeouts (200ms). For the kind of short-lived transactions a key-value store handles, a 200ms timeout is effectively only triggered by real deadlocks.
+
+### Why is a coarse DB-level mutex used alongside key-level locks?
+
+The LockManager provides logical isolation: it serializes conflicting key-level operations between transactions. But the B+Tree and BufferPool are not internally thread-safe — they use data structures (hash maps, doubly-linked lists, raw pointers) that would corrupt under concurrent access.
+
+Rather than add fine-grained page-level latching to the B+Tree (which is a substantial piece of work on its own), we use a single `db_mu_` held for the duration of each B+Tree operation. Two transactions won't physically run B+Tree code concurrently. But they're still logically isolated at the key level — a transaction waiting on `lm_.lock()` does not hold `db_mu_`, so the tree is free for other operations while it waits.
+
+### Why does Commit release locks last, after fsyncing?
+
+If we released key-level locks before fsyncing the WAL, a waiting transaction could acquire a lock, read the key, and proceed — but the data those reads are based on might not yet be durable. If the original committing transaction's WAL fsync then fails, the first transaction committed its reads based on data that never persisted. That's a durability violation.
+
+The correct order: fsync WAL first (data is durable), flush pages, then release locks. Other transactions are only unblocked after the commit is safe.
+
+### Describe how the concurrent counter stress test works.
+
+Four threads each increment a "counter" key 10 times with a read-modify-write pattern: read the current value, add 1, write it back. Without locking, many increments would be lost updates — two threads reading 5, both writing 6, losing one increment.
+
+With 2PL: `Get("counter")` acquires S-lock, `Put("counter",...)` upgrades to X. All four threads contend for the same X-lock, serializing them completely. Each increment is atomic from the perspective of the others.
+
+The expected final value is 40 (4 threads × 10 increments). The test verifies this. It also exercises the deadlock retry loop: if a `DeadlockException` is thrown mid-transaction, the transaction rolls back and retries from scratch.
+
+---
+
 ## Database internals
 
 ### What is ACID and why does each letter matter?
@@ -376,4 +435,72 @@ This is why cache misses in production database systems are treated as serious p
 
 ---
 
-*This file will keep growing. Next batch of questions will cover two-phase locking in depth, deadlock detection, the lock compatibility matrix, and what happens when two transactions try to write the same key simultaneously.*
+---
+
+## System design and performance
+
+### Walk me through the full commit path from Put() to durable data.
+
+1. `Put("k", "v")` acquires an X-lock on "k" from the LockManager. If another transaction holds any lock on "k", we block (or time out with DeadlockException).
+
+2. Under `db_mu_` (the B+Tree mutex), we read the current value of "k" to capture the before-image, then append a WRITE record to the WAL file with (key, before_val, after_val). The WAL write is a `pwrite` — no fsync yet.
+
+3. Still under `db_mu_`, we call `btree_.insert(k, v)` — the change is now in a dirty buffer pool page.
+
+4. `Commit()` appends a COMMIT record to the WAL, then calls `fsync(WAL fd)`. This is the durability point — after this returns, the commit is permanent regardless of what happens next.
+
+5. Under `db_mu_`, `bp_.flush_all()` writes all dirty B+Tree pages to the data file, then `dm_.flush()` fsyncs the data file.
+
+6. `lock_mgr_.release_all(txn_id)` releases all held locks, waking any waiting transactions.
+
+If the process crashes between steps 3 and 4, recovery sees no COMMIT and undoes the write. If it crashes between 4 and 5, recovery redoes the write from the WAL. Either way, the final state is consistent.
+
+### What are the performance bottlenecks in this implementation?
+
+Several deliberate simplifications create bottlenecks that a production system would address:
+
+**Two fsyncs per commit.** We fsync the WAL after writing the COMMIT record, and fsync the data file after flushing dirty pages. That's two disk synchronisation barriers per transaction. Group commit — batching multiple transactions' data into a single fsync — would multiply throughput without sacrificing durability.
+
+**Coarse B+Tree mutex.** A single `std::mutex db_mu_` serialises all B+Tree operations. Two transactions can never traverse or modify the tree concurrently, even if they're working on completely different parts of it. B+Tree latch crabbing (acquiring and releasing page-level latches as you traverse) would allow true parallel tree operations.
+
+**WAL not compacted.** We truncate the WAL entirely on close/reopen. A production WAL would use checkpointing: periodically write a checkpoint record, then only keep WAL records newer than the last checkpoint. This bounds recovery time and WAL file size without truncating everything.
+
+**No read-only transactions.** Every `Begin()` opens a read-write transaction with a WAL BEGIN record. Read-only transactions could skip the WAL entirely and use MVCC snapshot isolation instead of locking, allowing readers to never block writers.
+
+**FreeList fsyncs on every mutation.** Each deleted page triggers a write+fsync to page 0. Batching free-list mutations with the WAL would eliminate these extra fsyncs.
+
+### If you had to handle a million keys, what would break first?
+
+The FreeList would become the first structural limit — it's bounded by page 0's data area (1016 entries). In practice, a million-key database would have very few free pages at any given time (you'd need to delete nearly all keys to overflow this), so it's not an immediate problem.
+
+The buffer pool (64 pages = 256KB) is tiny for a million-key working set. A realistic deployment would increase `BUFFER_POOL_SIZE` significantly. The LRU eviction works correctly at any size; it would just start evicting hot pages, causing more disk reads.
+
+The WAL file size is bounded by the current transaction's writes. A single transaction inserting 1000 keys generates a WAL of ~40KB — perfectly fine. The issue is if someone puts everything in one giant transaction, which is both slow and WAL-heavy.
+
+The coarse B+Tree mutex would become a throughput bottleneck well before any of these structural limits — with 4+ concurrent writers, lock contention dominates.
+
+### What would Phase 2 (TCP server) add and how would it affect the existing code?
+
+Phase 2 wraps the Phase 1 embedded library with a network layer. The core changes:
+
+A TCP server listens on a configurable port. Each client connection gets a thread (or async handler) that reads serialized operation requests and executes them against the DB. The protocol would be something like: 4-byte length prefix + opcode + payload (key/value bytes).
+
+The transaction model maps cleanly: each client connection tracks an open transaction; `BEGIN`/`GET`/`PUT`/`DELETE`/`COMMIT`/`ROLLBACK` map directly to the existing API. The connection thread calls `db->Begin()`, issues operations, and calls `Commit()` or `Rollback()`.
+
+The existing code changes minimally. The LockManager already handles concurrent transactions from multiple threads. The DB-level mutex already protects B+Tree access. The main addition is the network I/O layer on top.
+
+The biggest design question is client failure handling: if a client disconnects mid-transaction, the server must detect it and call `Rollback()`. Without this, locks held by the dead client would block other clients indefinitely. TCP keepalive + connection timeout + explicit rollback on disconnect handle this.
+
+### What's the difference between KeyVDB and something like Redis?
+
+Both are key-value stores. The differences are architectural:
+
+**Redis is in-memory; KeyVDB is disk-based.** Redis stores data in RAM with optional persistence (RDB snapshots or AOF log). KeyVDB stores data on disk with a page cache in RAM. Redis is faster; KeyVDB's working set can exceed available RAM.
+
+**Redis is single-threaded (mostly); KeyVDB is concurrent.** Redis processes commands in a single event loop — no concurrent modifications possible. KeyVDB has actual multi-transaction concurrency with 2PL isolation.
+
+**Redis doesn't provide full ACID.** Redis transactions (`MULTI`/`EXEC`) are atomic in the sense that no other command interleaves, but there's no isolation (you can't read your own uncommitted writes mid-transaction) and durability depends on the persistence mode. KeyVDB provides all four ACID properties.
+
+**Different data model.** Redis supports rich data types (lists, sorted sets, hashes, streams). KeyVDB is a pure key-value store with string keys and values — simpler, but the foundation the richer types would be built on.
+
+*Phase 1 is complete. The full source, test suite, and documentation are at the repository linked in the README.*
